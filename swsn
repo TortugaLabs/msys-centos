@@ -1,0 +1,313 @@
+#!/usr/bin/perl -w
+#
+#   swsn
+#   Copyright (C) 2009 Alejandro Liu Ly
+#
+#   swsn is free software; you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as
+#   published by the Free Software Foundation; either version 2 of 
+#   the License, or (at your option) any later version.
+#
+#   swsn is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public
+#   License along with this program.  If not, see 
+#   <http://www.gnu.org/licenses/>
+#
+#++
+# = SWSN(8)
+# :Revision: 1.0
+# :Author: A Liu Ly
+#
+# == NAME
+#
+# swsn -  Synchronise installed packages to install lists
+#
+# == SYNOPSIS
+#
+# *swsn* _[options]_ _mode_ _[pkg-list-file]_
+#
+# == DESCRIPTION
+#
+# *swsn* is a script use to synchronise an installed RPM set to a
+# specified _pkg-list-file_ or standard input.
+#
+# Note that this command does not actually install or remove
+# packages but creates a list of packages that need to be
+# installed or removed.  This list can then be fed to *yum(1)*
+# for actual installation.
+#
+# == INPUT FILE
+#
+# Accepts as input files with one package per line.  +#+ are taken
+# as comments.  The package can be specified by package name
+# optionally followed by a architecture (separated by a dot +.+
+# character.)  For example:
+#
+# ----
+# | bash		# Just a package
+# | wine.i386		# A package with a specific architecture type
+# ----
+#
+# == MODES
+#
+# The following modes are supported:
+#
+#  * *--add*::
+#    Display only packages that need to be added.
+#  * *--remove*::
+#    Display only packages that need to be deleted.
+#  * *--full*
+#    *(Not* *recommended.)*  Displays packages that need to be added
+#    or removed.  Package names that need to be added are prefixed with
+#    a plus +(+)+ character, while packages that need to be removed
+#    are prefixed with a minus +(-)+ sign.
+#
+# == BUGS
+#
+# *--full* mode will make a list of packages that need to be add and/or
+# removed.  However since *swsn* only examines the currently installed
+# database, it does not know of the dependancies that the newly
+# installed packages will need.  Therefore, it may request for
+#  packages to be removed which may be needed by the new packages.
+#
+# == SEE ALSO
+#
+# *yum(8)*, *yum-shell(8)*, *rpm(8)*
+#--
+use strict;
+use warnings;
+
+my %keeps = ();
+my %bl = ();
+foreach my $bls ('(none)','rpmlib(VersionedDependencies)',
+		 'rpmlib(PartialHardlinkSets)',
+		 'rpmlib(PayloadFilesHavePrefix)',
+		 'rpmlib(CompressedFileNames)') {
+    $bl{$bls} = 1;
+}
+foreach my $keep ('gpg-pubkey') {
+    $keeps{$keep} = 1;
+}
+while (scalar(@ARGV)) {
+    last unless ($ARGV[0] =~ s/^--bl=//);
+    $bl{$ARGV[0]} = 1;
+    shift;
+}
+while (scalar(@ARGV)) {
+    last unless ($ARGV[0] =~ s/^--keep=//);
+    $keeps{$ARGV[0]} = 1;
+    shift;
+}
+#use Data::Dumper; print Dumper(\%bl);
+#
+# Determine what is needed
+#
+my $mode = undef;
+unless ($ARGV[0]) {
+    die
+	"No mode specified\n".
+	"Usage:\n\tswsn [--full|--add|--remove] [input]\n";
+}
+
+if ($ARGV[0] eq '--full') {
+    $mode = 'full';
+} elsif ($ARGV[0] eq '--add') {
+    $mode = 'add';
+} elsif ($ARGV[0] eq '--remove') {
+    $mode = 'remove';
+} else {
+    die "Unknown mode $ARGV[0]\n";
+}
+shift;
+
+sub readlist($$) {
+    my ($inp,$lst) = @_;
+    unless (ref($inp)) {
+	open(my $fh,"<",$inp) || die "$inp: $!\n";
+	$inp = $fh;
+    }
+    while (<$inp>) {
+	s/^\s+//;
+	s/\s+$//;
+	s/\#.*$//;
+	next unless ($_);
+
+	push @$lst,$_;
+    }
+    close($inp);
+}
+
+
+#
+# Read the required list...
+#
+my @reqs = ();
+if (scalar @ARGV) {
+    foreach my $f (@ARGV) {
+	readlist($f,\@reqs);
+    }
+} else {
+    readlist(\*STDIN,\@reqs);
+}
+# Process keeps...
+foreach my $c (@reqs) {
+    delete $keeps{$c} if ($keeps{$c});
+}
+foreach my $c (keys %keeps) {
+    push @reqs,$c;
+}
+
+my $ROOT="";
+
+
+sub parseArch($) {
+    my ($fname) = @_;
+    my $arch = undef;
+    if ($fname =~ s/\.([^-\.]+)$//) {
+	$arch = $1;
+	# Make sure this was not a soname
+	if ($arch =~ /^so\(/) {
+	    $fname .= '.'.$arch;
+	    $arch = undef;
+	}
+    }
+    return ($fname,$arch);
+}
+
+my %pkgs = ();
+my %xref = (
+	    'prov' => {},
+	    'reqs' => {},
+	    'file' => {},
+	    );
+
+open(my $fh,'-|',qw(rpm -qa --qf),
+     '[%{NAME} %{VERSION}-%{RELEASE} %{ARCH} prov %{PROVIDENAME} %|PROVIDEFLAGS?{%{PROVIDEFLAGS:depflags} %{PROVIDEVERSION}}:{}|\n][%{NAME} %{VERSION}-%{RELEASE} %{ARCH} reqs %{REQUIRENAME} %{REQUIREFLAGS:depflags} %{REQUIREVERSION}\n][%{NAME} %{VERSION}-%{RELEASE} %{ARCH} file %{FILENAMES}\n]') || die "exec: $!\n";
+
+### open(my $t,'>',"trc") || die "Trace: $!\n"; #DBG
+
+while(<$fh>) {
+    ### print $t $_;#DBG
+    s/\s+$//;
+    my ($pkg,$vr,$arch,$tag,$ent,$flags) = split(/\s+/,$_,6);
+    unless ($pkgs{$pkg}) {
+	$pkgs{$pkg} = {};
+    }
+    my $pkgdat = $pkgs{$pkg};
+    unless ($pkgs{$pkg}->{$arch}) {
+	$pkgs{$pkg}->{$arch} = {};
+    }
+    my $archdat = $pkgs{$pkg}->{$arch};
+
+    unless ($archdat->{$vr}) {
+	$archdat->{$vr} = {
+	    'prov' => {},
+	    'reqs' => {},
+	    'file' => {},
+	};
+    }
+    next unless ($ent);
+
+    $archdat->{$vr}->{$tag}->{$ent} = $flags;
+    my $pkgvra = [ $pkg,$vr,$arch ];
+
+    if ($xref{$tag}->{$ent}) {
+	push @{$xref{$tag}->{$ent}},$pkgvra;
+    } else {
+	$xref{$tag}->{$ent} = [ $pkgvra ] ;
+    }
+}
+close($fh);
+
+sub solve_arch($$$) {
+    my ($pkgdat,$misses,$x) = @_;
+    return if ($pkgdat->{solved});
+    $pkgdat->{solved} = 1;
+
+    #print "trace $x ",join(',',keys %$pkgdat),"\n";
+    # Loop through the different versions...
+    foreach my $vdat (values %$pkgdat) {
+	next unless (ref $vdat);
+	#print "\tTRC ",join(',',keys %$vdat),"\n";
+	# Go through its requirements...
+	foreach my $rr (keys %{$vdat->{reqs}}) {
+	    #reprint "REQ ",$rr,"\n";
+	    resolve($rr,$misses);
+	}
+    }
+}
+
+
+
+sub resolve {
+    my ($pkgfull,$misses) = @_;
+
+    # These should never be looked for...
+    return if ($bl{$pkgfull});
+
+    # print "RESOLVING $pkgfull\n";
+    return if ($misses->{$pkgfull}); # Already we missed this one!
+    my ($name,$arch) = parseArch($pkgfull);
+
+    unless ($pkgs{$name}) {
+	# Check in the provides index...
+	if ($xref{prov}->{$pkgfull}) {
+	    foreach my $prov (@{ $xref{prov}->{$pkgfull}}) {
+		my ($p_pkg,$p_vr,$p_arch) = @$prov;
+		resolve($p_pkg,$misses);
+	    }
+	    return;
+	}
+	# Check in the files index
+	if ($xref{file}->{$pkgfull}) {
+	    foreach my $file (@{ $xref{file}->{$pkgfull}}) {
+		my ($p_pkg,$p_vr,$p_arch) = @$file;
+		resolve($p_pkg,$misses);
+	    }
+	    return;
+	}
+	# One last ditch attempt...
+	return if (substr($pkgfull,0,1) eq '/' && -e "$ROOT$pkgfull");
+	$misses->{$pkgfull} = 1;
+    }
+    # Check if we need to mach arch
+    if ($arch) {
+	unless ($pkgs{$name}->{$arch}) {
+	    # OK... if arch specified we do not search provides
+	    $misses->{$pkgfull} = 1;
+	    return;
+	}
+	solve_arch($pkgs{$name}->{$arch},$misses,$pkgfull);
+	return;
+    }
+    foreach my $pkgarch (values %{$pkgs{$name}}) {
+	solve_arch($pkgarch,$misses,$pkgfull);
+    }
+}
+
+my %missing = ();
+foreach my $sw (@reqs) {
+    resolve($sw,\%missing);
+}
+
+#
+if ($mode ne 'remove') {
+    my $prefix = $mode eq 'full' ? '+' : '';
+    foreach my $pkg (keys %missing) {
+	print $prefix,$pkg,"\n";
+    }
+}
+if ($mode ne 'add') {
+    my $prefix = $mode eq 'full' ? '-' : '';
+
+    while (my ($pkg,$pdat) = each %pkgs) {
+	while (my ($arch,$adat) = each %$pdat) {
+	    print "$prefix$pkg.$arch\n"  unless ($adat->{solved});
+	}
+    }
+}
+
